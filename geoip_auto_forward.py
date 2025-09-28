@@ -16,8 +16,8 @@ from datetime import datetime
 # --- Config ---
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 30000
-FORWARD_HOST = "192.168.11.205"
-FORWARD_PORT = 433
+FORWARD_HOST = "192.168.11.203"
+FORWARD_PORT = 443
 
 DB_CONFIG = {
     "host": "localhost",
@@ -132,3 +132,4 @@ def start_server():
 
 if __name__ == "__main__":
     start_server()
+
