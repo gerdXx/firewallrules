@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-geoip_auto_forward.py (iptables/ipset Version)
-- Prüft eingehende IPs in MySQL
-- Holt Land via ipapi.co falls nicht vorhanden
-- Schreibt IP in ipset (de_allow oder non_de_block)
+GeoIP Auto Forward (iptables-Version)
+- Prüft IPs in MySQL / via ipapi.co
+- Wenn DE → erstellt iptables-Forward-Regel von <IP>:30000 → 192.168.11.203:443
+- Wenn nicht DE → IP in non_de_block ipset
 """
 
 import mysql.connector
 import requests
 import subprocess
 from datetime import datetime
+import time
+
+FORWARD_HOST = "192.168.11.203"
+FORWARD_PORT = 443
+LISTEN_PORT = 30000
 
 DB_CONFIG = {
     "host": "localhost",
@@ -21,8 +26,16 @@ DB_CONFIG = {
 IPSET_ALLOW = "de_allow"
 IPSET_BLOCK = "non_de_block"
 
+
 def run(cmd):
-    subprocess.run(cmd, check=False)
+    """Hilfsfunktion für ipset/iptables-Kommandos"""
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def ensure_ipsets():
+    run(["ipset", "create", IPSET_ALLOW, "hash:ip", "-exist"])
+    run(["ipset", "create", IPSET_BLOCK, "hash:ip", "-exist"])
+
 
 def init_db():
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -38,14 +51,16 @@ def init_db():
     cursor.close()
     conn.close()
 
-def get_ip_info(ip):
+
+def get_all_ips():
     conn = mysql.connector.connect(**DB_CONFIG)
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM ip_cache WHERE ip=%s", (ip,))
-    row = cursor.fetchone()
+    cursor = conn.cursor()
+    cursor.execute("SELECT ip, country FROM ip_cache")
+    rows = cursor.fetchall()
     cursor.close()
     conn.close()
-    return row
+    return rows
+
 
 def save_ip_info(ip, country):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -59,6 +74,7 @@ def save_ip_info(ip, country):
     cursor.close()
     conn.close()
 
+
 def fetch_country(ip):
     try:
         r = requests.get(f"https://ipapi.co/{ip}/country/", timeout=5)
@@ -68,28 +84,68 @@ def fetch_country(ip):
         pass
     return None
 
-def process_ip(ip):
-    row = get_ip_info(ip)
-    if row:
-        country = row["country"]
-    else:
+
+def forward_rule_exists(ip):
+    """Prüfen ob Regel für diese IP schon existiert"""
+    check = run([
+        "iptables", "-t", "nat", "-C", "PREROUTING",
+        "-s", ip, "-p", "tcp", "--dport", str(LISTEN_PORT),
+        "-j", "DNAT", "--to-destination", f"{FORWARD_HOST}:{FORWARD_PORT}"
+    ])
+    return check.returncode == 0
+
+
+def add_forward_rule(ip):
+    if forward_rule_exists(ip):
+        return
+
+    # DNAT-Regel
+    run([
+        "iptables", "-t", "nat", "-A", "PREROUTING",
+        "-s", ip, "-p", "tcp", "--dport", str(LISTEN_PORT),
+        "-j", "DNAT", "--to-destination", f"{FORWARD_HOST}:{FORWARD_PORT}"
+    ])
+
+    # Forward erlauben
+    run([
+        "iptables", "-A", "FORWARD",
+        "-s", ip, "-d", FORWARD_HOST,
+        "-p", "tcp", "--dport", str(FORWARD_PORT),
+        "-j", "ACCEPT"
+    ])
+    print(f"[+] iptables-Forward für {ip} → {FORWARD_HOST}:{FORWARD_PORT} gesetzt")
+
+
+def process_ip(ip, country=None):
+    if not country:
         country = fetch_country(ip)
         if not country:
-            print(f"[!] Konnte Land für {ip} nicht bestimmen → block")
+            print(f"[!] {ip} → Land unbekannt → block")
             run(["ipset", "add", IPSET_BLOCK, ip, "-exist"])
             return
+
         save_ip_info(ip, country)
 
     if country == "DE":
-        print(f"[+] {ip} erlaubt (DE)")
         run(["ipset", "add", IPSET_ALLOW, ip, "-exist"])
+        add_forward_rule(ip)
+        print(f"[ALLOW] {ip} (DE)")
     else:
-        print(f"[-] {ip} blockiert ({country})")
         run(["ipset", "add", IPSET_BLOCK, ip, "-exist"])
+        print(f"[BLOCK] {ip} ({country})")
+
 
 if __name__ == "__main__":
+    print("[*] GeoIP Auto Forward (iptables-Version) startet...")
     init_db()
-    # Beispiel: IPs manuell verarbeiten (später durch Logs oder Webinterface triggern)
-    test_ips = ["8.8.8.8", "91.12.45.33"]
-    for ip in test_ips:
-        process_ip(ip)
+    ensure_ipsets()
+
+    while True:
+        try:
+            ips = get_all_ips()
+            for ip, country in ips:
+                process_ip(ip, country)
+        except Exception as e:
+            print(f"[!] Fehler: {e}")
+
+        time.sleep(60)  # alle 60 Sekunden prüfen
