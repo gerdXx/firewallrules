@@ -1,66 +1,46 @@
 #!/usr/bin/env python3
-"""
-Flask Webinterface für GeoIP-Filter
-- Listet alle bekannten IPs
-- Ermöglicht Allow / Block / Unblock
-"""
-
-from flask import Flask, render_template_string, redirect, url_for
-import mysql.connector
+from flask import Flask, render_template_string, redirect, url_for, request
 import subprocess
+import mysql.connector
 from datetime import datetime
 
+# --- Konfiguration (ggf. anpassen) ---
 DB_CONFIG = {
     "host": "localhost",
     "user": "geoipuser",
     "password": "geopass",
     "database": "geoipdb"
 }
-
 IPSET_ALLOW = "de_allow"
 IPSET_BLOCK = "non_de_block"
-
-FORWARD_HOST = "192.168.11.203"
-FORWARD_PORT = 443
 LISTEN_PORT = 30000
+TARGET_IP = "192.168.11.203"
+TARGET_PORT = 443
 
 app = Flask(__name__)
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+TEMPLATE = """
+<!doctype html>
 <html>
-<head>
-    <title>GeoIP Filter</title>
-    <style>
-        body { font-family: Arial; padding: 20px; }
-        table { border-collapse: collapse; width: 100%; }
-        th, td { border: 1px solid #ddd; padding: 8px; }
-        th { background: #f2f2f2; }
-        a { padding: 4px 8px; background: #ddd; margin: 2px; text-decoration: none; }
-        a.allow { background: #8f8; }
-        a.block { background: #f88; }
-        a.unblock { background: #88f; color: #fff; }
-    </style>
-</head>
+<head><meta charset="utf-8"><title>GeoIP Filter</title></head>
 <body>
-    <h1>GeoIP Filter - Webinterface</h1>
-    <table>
-        <tr>
-            <th>IP</th><th>Country</th><th>Last Seen</th><th>Aktionen</th>
-        </tr>
-        {% for ip,country,last_seen in ips %}
-        <tr>
-            <td>{{ ip }}</td>
-            <td>{{ country }}</td>
-            <td>{{ last_seen }}</td>
-            <td>
-                <a href="{{ url_for('allow_ip', ip=ip) }}" class="allow">Allow</a>
-                <a href="{{ url_for('block_ip', ip=ip) }}" class="block">Block</a>
-                <a href="{{ url_for('unblock_ip', ip=ip) }}" class="unblock">Unblock</a>
-            </td>
-        </tr>
-        {% endfor %}
-    </table>
+<h1>GeoIP Filter</h1>
+<form method="post" action="/add">
+  IP: <input name="ip" required> <button type="submit">Add (check+allow)</button>
+</form>
+<table border="1" cellpadding="4">
+<tr><th>IP</th><th>Country</th><th>Last seen</th><th>Actions</th></tr>
+{% for ip,country,last in rows %}
+<tr>
+<td>{{ip}}</td><td>{{country}}</td><td>{{last}}</td>
+<td>
+  <a href="{{ url_for('allow', ip=ip) }}">Allow</a> |
+  <a href="{{ url_for('block', ip=ip) }}">Block</a> |
+  <a href="{{ url_for('unblock', ip=ip) }}">Unblock</a>
+</td>
+</tr>
+{% endfor %}
+</table>
 </body>
 </html>
 """
@@ -70,61 +50,70 @@ def run(cmd):
 
 def get_all_ips():
     conn = mysql.connector.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    cursor.execute("SELECT ip, country, last_seen FROM ip_cache ORDER BY last_seen DESC")
-    rows = cursor.fetchall()
-    cursor.close()
+    cur = conn.cursor()
+    cur.execute("SELECT ip,country,last_seen FROM ip_cache ORDER BY last_seen DESC")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
-def save_ip_info(ip, country):
+def save_ip(ip, country):
     conn = mysql.connector.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO ip_cache (ip, country, last_seen)
-        VALUES (%s, %s, %s)
-        ON DUPLICATE KEY UPDATE country=%s, last_seen=%s
-    """, (ip, country, datetime.now(), country, datetime.now()))
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ip_cache (ip,country,last_seen) VALUES (%s,%s,%s)
+        ON DUPLICATE KEY UPDATE country=VALUES(country), last_seen=VALUES(last_seen)
+    """, (ip, country, datetime.utcnow()))
     conn.commit()
-    cursor.close()
+    cur.close()
     conn.close()
 
-def add_forward_rule(ip):
-    run([
-        "iptables", "-t", "nat", "-A", "PREROUTING",
-        "-s", ip, "-p", "tcp", "--dport", str(LISTEN_PORT),
-        "-j", "DNAT", "--to-destination", f"{FORWARD_HOST}:{FORWARD_PORT}"
-    ])
-    run([
-        "iptables", "-A", "FORWARD",
-        "-s", ip, "-d", FORWARD_HOST,
-        "-p", "tcp", "--dport", str(FORWARD_PORT),
-        "-j", "ACCEPT"
-    ])
-    print(f"[WEB] Forward-Regel für {ip} gesetzt")
+# ipset add/del helpers
+def ipset_add(setname, ip):
+    run(["ipset", "add", setname, ip, "-exist"])
+
+def ipset_del(setname, ip):
+    run(["ipset", "del", setname, ip])
+
+# iptables rule removal helper
+def remove_forward_rule(ip):
+    # remove both nat PREROUTING and forward
+    run(["iptables", "-t", "nat", "-D", "PREROUTING", "-s", ip, "-p", "tcp", "--dport", str(LISTEN_PORT),
+         "-j", "DNAT", "--to-destination", f"{TARGET_IP}:{TARGET_PORT}"])
+    run(["iptables", "-D", "FORWARD", "-s", ip, "-d", TARGET_IP, "-p", "tcp", "--dport", str(TARGET_PORT), "-j", "ACCEPT"])
 
 @app.route("/")
 def index():
-    ips = get_all_ips()
-    return render_template_string(HTML_TEMPLATE, ips=ips)
+    rows = get_all_ips()
+    return render_template_string(TEMPLATE, rows=rows)
 
 @app.route("/allow/<ip>")
-def allow_ip(ip):
-    run(["ipset", "add", IPSET_ALLOW, ip, "-exist"])
-    save_ip_info(ip, "DE")
-    add_forward_rule(ip)
+def allow(ip):
+    ipset_add(IPSET_ALLOW, ip)
+    save_ip(ip, "DE")
+    # Optionally add rules immediately (auto-daemon also adds them)
+    run(["/usr/bin/python3", "/opt/geoipfilter/geoip_auto_forward.py"])  # quick trigger (will check ipset)
     return redirect(url_for("index"))
 
 @app.route("/block/<ip>")
-def block_ip(ip):
-    run(["ipset", "add", IPSET_BLOCK, ip, "-exist"])
-    save_ip_info(ip, "XX")
+def block(ip):
+    ipset_add(IPSET_BLOCK, ip)
+    save_ip(ip, "XX")
     return redirect(url_for("index"))
 
 @app.route("/unblock/<ip>")
-def unblock_ip(ip):
-    run(["ipset", "del", IPSET_ALLOW, ip], check=False)
-    run(["ipset", "del", IPSET_BLOCK, ip], check=False)
+def unblock(ip):
+    ipset_del(IPSET_ALLOW, request.view_args['ip'])
+    ipset_del(IPSET_BLOCK, request.view_args['ip'])
+    remove_forward_rule(request.view_args['ip'])
+    return redirect(url_for("index"))
+
+@app.route("/add", methods=["POST"])
+def add():
+    ip = request.form.get("ip")
+    # optional: GeoIP lookup here, but we just save placeholder
+    save_ip(ip, "??")
+    ipset_add(IPSET_ALLOW, ip)
     return redirect(url_for("index"))
 
 if __name__ == "__main__":
